@@ -1,4 +1,18 @@
 # Algo-Orbit-Finder
-Algorithm that finds the best speed and direction to send a manually set planet pos around a set num of randomly placed stars for the longest survival time without crashing.
-Made in python using pygame, with numpy, gc and other built in libraries.
-Still **WIP**.
+A gravity toy where you place a planet and choose how many stars to scatter. The algorithm searches for the **best chaotic yet long-lasting orbit**. 
+maximizing survival time while keeping the motion wild and unpredictable.
+
+### Features
+- Click to place your planet
+- Choose number of stars (0–100)
+- Smart multi-cluster star placement (no boring symmetric clumps)
+- Score-based search: finds the longest + most chaotic orbit within time limit
+- Live chaos score, energy drift tracking, and detailed final statistics
+- Multiple trail modes and visual helpers (COM, velocity vector)
+
+Built in **Python** with **Pygame** and **NumPy**.
+
+### Requirement
+```bash
+pip install pygame numpy
+python orbit.py
