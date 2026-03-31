@@ -14,5 +14,4 @@ Built in **Python** with **Pygame** and **NumPy**.
 
 ### Requirement
 ```bash
-pip install pygame numpy
-python orbit.py
+py -m pip install pygame numpy
