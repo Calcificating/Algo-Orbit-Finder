@@ -7,6 +7,7 @@ import time
 import numpy as np
 import json
 import os
+import gc
 
 # Constants
 WIDTH = 1400
@@ -137,14 +138,12 @@ def is_in_bounds(pos, margin=MARGIN):
 # ============================================================================
 
 def place_stars_randomly(n, planet_pos, min_star_dist, min_planet_dist):
-    """Place stars with adjustable parameters"""
+    """Original placement (kept as fallback)."""
     if n == 0:
         return []
-    
     stars = []
     max_attempts_per_star = 800
     safe_margin = MARGIN + 100
-    
     for i in range(n):
         placed = False
         for attempt in range(max_attempts_per_star):
@@ -154,52 +153,186 @@ def place_stars_randomly(n, planet_pos, min_star_dist, min_planet_dist):
             else:
                 x = random.uniform(safe_margin, WIDTH - safe_margin)
                 y = random.uniform(safe_margin, HEIGHT - safe_margin)
-            
             x = max(safe_margin, min(WIDTH - safe_margin, x))
             y = max(safe_margin, min(HEIGHT - safe_margin, y))
-            
             dist_to_planet = math.hypot(x - planet_pos[0], y - planet_pos[1])
             if dist_to_planet < min_planet_dist:
                 continue
-            
-            too_close = False
-            for sx, sy in stars:
-                dist = math.hypot(x - sx, y - sy)
-                if dist < min_star_dist:
-                    too_close = True
-                    break
-            
+            too_close = any(math.hypot(x - sx, y - sy) < min_star_dist for sx, sy in stars)
             if not too_close:
                 stars.append((x, y))
                 placed = True
                 break
-        
         if not placed:
             angle = random.uniform(0, 2 * math.pi)
             distance = min_planet_dist + random.uniform(20, 100)
-            if stars:
-                ref_star = random.choice(stars)
-                x = ref_star[0] + distance * math.cos(angle)
-                y = ref_star[1] + distance * math.sin(angle)
-            else:
-                x = planet_pos[0] + distance * math.cos(angle)
-                y = planet_pos[1] + distance * math.sin(angle)
-            
-            x = max(safe_margin, min(WIDTH - safe_margin, x))
-            y = max(safe_margin, min(HEIGHT - safe_margin, y))
+            ref = random.choice(stars) if stars else planet_pos
+            x = max(safe_margin, min(WIDTH - safe_margin, ref[0] + distance * math.cos(angle)))
+            y = max(safe_margin, min(HEIGHT - safe_margin, ref[1] + distance * math.sin(angle)))
             stars.append((x, y))
-    
     return stars
+
+
+def place_stars_multi_cluster(n, planet_pos, min_star_dist, min_planet_dist):
+    """Multi-cluster placement that kills center symmetry and creates uneven gravitational
+    landscapes.  2-4 randomly scattered hot-zones + a handful of far-flung perturber stars."""
+    if n == 0:
+        return []
+
+    safe_margin = MARGIN + 100
+    max_att = 600
+
+    # --- Build hot zones scattered across the play area (not biased to center) ---
+    n_clusters = random.randint(2, min(4, max(2, n // 4 + 1)))
+    hot_zones = []
+    for _ in range(n_clusters):
+        # Deliberately avoid a pure-center cluster by splitting into quadrant-ish zones
+        qx = random.choice([
+            random.uniform(safe_margin + 40, WIDTH  // 2 - 60),
+            random.uniform(WIDTH  // 2 + 60, WIDTH  - safe_margin - 40),
+        ])
+        qy = random.choice([
+            random.uniform(safe_margin + 40, HEIGHT // 2 - 60),
+            random.uniform(HEIGHT // 2 + 60, HEIGHT - safe_margin - 40),
+        ])
+        spread = random.uniform(70, 230)
+        hot_zones.append((qx, qy, spread))
+
+    # High-n configs: sprinkle a "resonant ring" at a very different radius for one cluster
+    if n >= 30 and random.random() < 0.5:
+        ring_cx = random.uniform(safe_margin + 80, WIDTH  - safe_margin - 80)
+        ring_cy = random.uniform(safe_margin + 80, HEIGHT - safe_margin - 80)
+        hot_zones.append((ring_cx, ring_cy, random.uniform(180, 320)))
+
+    n_perturbers   = max(1, n // 6)
+    n_cluster_stars = n - n_perturbers
+
+    stars = []
+
+    def _try_place(x_cand, y_cand):
+        x_cand = max(safe_margin, min(WIDTH  - safe_margin, x_cand))
+        y_cand = max(safe_margin, min(HEIGHT - safe_margin, y_cand))
+        if math.hypot(x_cand - planet_pos[0], y_cand - planet_pos[1]) < min_planet_dist:
+            return None
+        if any(math.hypot(x_cand - sx, y_cand - sy) < min_star_dist for sx, sy in stars):
+            return None
+        return (x_cand, y_cand)
+
+    # --- Cluster stars ---
+    for i in range(n_cluster_stars):
+        zone = hot_zones[i % len(hot_zones)]
+        placed = False
+        for _ in range(max_att):
+            pt = _try_place(random.gauss(zone[0], zone[2]),
+                            random.gauss(zone[1], zone[2]))
+            if pt:
+                stars.append(pt)
+                placed = True
+                break
+        if not placed:
+            angle = random.uniform(0, 2 * math.pi)
+            dist  = min_planet_dist + random.uniform(60, 220)
+            fallback = _try_place(planet_pos[0] + dist * math.cos(angle),
+                                  planet_pos[1] + dist * math.sin(angle))
+            stars.append(fallback if fallback else (
+                max(safe_margin, min(WIDTH - safe_margin, planet_pos[0] + dist * math.cos(angle))),
+                max(safe_margin, min(HEIGHT - safe_margin, planet_pos[1] + dist * math.sin(angle))),
+            ))
+
+    # --- Perturber stars — biased toward edges / corners ---
+    for _ in range(n_perturbers):
+        placed = False
+        for _ in range(max_att):
+            edge = random.random()
+            if edge < 0.25:
+                x = random.uniform(safe_margin, safe_margin + 220)
+            elif edge < 0.5:
+                x = random.uniform(WIDTH - safe_margin - 220, WIDTH - safe_margin)
+            else:
+                x = random.uniform(safe_margin, WIDTH - safe_margin)
+            if edge < 0.5:
+                y = random.uniform(safe_margin, HEIGHT - safe_margin)
+            else:
+                y = (random.uniform(safe_margin, safe_margin + 220)
+                     if random.random() < 0.5
+                     else random.uniform(HEIGHT - safe_margin - 220, HEIGHT - safe_margin))
+            pt = _try_place(x, y)
+            if pt:
+                stars.append(pt)
+                placed = True
+                break
+        if not placed:
+            angle = random.uniform(0, 2 * math.pi)
+            dist  = min_planet_dist + random.uniform(120, 350)
+            stars.append((
+                max(safe_margin, min(WIDTH  - safe_margin, planet_pos[0] + dist * math.cos(angle))),
+                max(safe_margin, min(HEIGHT - safe_margin, planet_pos[1] + dist * math.sin(angle))),
+            ))
+
+    return stars
+
+
+def _quick_check_asymmetry_plain(stars, planet_pos):
+    """Fast pre-filter on a plain Python list — avoids allocating a numpy array
+    for configs that are obviously too symmetric.  Checks distance CV only."""
+    if len(stars) <= 2:
+        return True
+    px, py = planet_pos
+    dists  = [math.hypot(sx - px, sy - py) for sx, sy in stars]
+    mean_d = sum(dists) / len(dists)
+    if mean_d < 1e-6:
+        return False
+    var_d = sum((d - mean_d) ** 2 for d in dists) / len(dists)
+    cv    = math.sqrt(var_d) / mean_d
+    return cv >= 0.10   # same spirit as check_asymmetry's 0.12, slightly looser
+
+
+def compute_chaos_potential(stars_arr, planet_pos):
+    """Quick scalar heuristic: high = gravitationally uneven → higher chaos potential.
+    Uses weighted sum of 1/r² scaled by the coefficient-of-variation of distances."""
+    p       = np.array(planet_pos, dtype=float)
+    dists   = np.sqrt(np.sum((stars_arr - p) ** 2, axis=1))
+    dists   = np.maximum(dists, 1.0)
+    inv_sq  = 1.0 / dists ** 2
+    total   = float(np.sum(inv_sq))
+    dist_cv = float(np.std(dists) / (np.mean(dists) + 1e-6))
+    return total * (1.0 + dist_cv)
+
+
+def check_asymmetry(stars_arr, planet_pos):
+    """Return True if the angular + distance distribution is acceptably irregular.
+    Rejects configs that look like symmetric rings or uniform lattices."""
+    if len(stars_arr) <= 2:
+        return True
+    p = np.array(planet_pos, dtype=float)
+    diff  = stars_arr - p
+    angles = np.arctan2(diff[:, 1], diff[:, 0])
+    dists  = np.sqrt(np.sum(diff ** 2, axis=1))
+
+    # Angular gap irregularity: sorted gaps should *not* all be equal
+    sorted_a = np.sort(angles)
+    gaps     = np.diff(sorted_a)
+    if len(gaps) > 1:
+        gap_cv = float(np.std(gaps) / (np.mean(gaps) + 1e-6))
+        if gap_cv < 0.25:          # suspiciously even angular distribution
+            return False
+
+    # Distance coefficient of variation: too uniform → boring stable orbit
+    dist_cv = float(np.std(dists) / (np.mean(dists) + 1e-6))
+    if dist_cv < 0.12:
+        return False
+
+    return True
 
 # ============================================================================
 # MULTI-STAGE VALIDATION
 # ============================================================================
 
-def quick_validate(p_pos, p_vel, stars_arr, steps=2000, dt=0.06):
-    """Quick validation"""
+def quick_validate(p_pos, p_vel, stars_arr, steps=2000, dt=0.05):
+    """Quick validation — uses exact collision distance so chaotic seeds aren't over-penalised."""
     pos = np.array(p_pos, dtype=float)
     vel = np.array(p_vel, dtype=float)
-    collision_dist = (PLANET_RADIUS + STAR_RADIUS) * 1.5
+    collision_dist = PLANET_RADIUS + STAR_RADIUS   # exact, not 1.5× inflated
     
     for step in range(steps):
         d = stars_arr - pos
@@ -255,17 +388,14 @@ def full_validate(p_pos, p_vel, stars_arr, steps=15000, dt=0.03):
 # ============================================================================
 
 def calculate_velocity_smart(p_pos, com, dist_to_com, total_mass, dist_to_boundary, phase, n):
-    """Adjusted for high n"""
+    """Legacy single-seed velocity (kept for reference)."""
     r_x = com[0] - p_pos[0]
     r_y = com[1] - p_pos[1]
-    
     if dist_to_com < 1:
         return (0, 0)
-    
     v_circular = math.sqrt(G * total_mass / dist_to_com)
     boundary_safety_ratio = dist_to_boundary / dist_to_com
     perturbation_scale = 1 / math.sqrt(max(1, n))
-    
     if boundary_safety_ratio < 1.2:
         velocity_factor = random.uniform(0.88, 1.02)
         perturbation = 0.05 * perturbation_scale
@@ -282,112 +412,411 @@ def calculate_velocity_smart(p_pos, com, dist_to_com, total_mass, dist_to_bounda
         else:
             velocity_factor = random.uniform(0.80, 1.15)
             perturbation = 0.12 * perturbation_scale
-    
     v_magnitude = v_circular * velocity_factor
     direction = random.choice([1, -1])
-    
     v_x = direction * (-r_y / dist_to_com * v_magnitude)
     v_y = direction * (r_x / dist_to_com * v_magnitude)
-    
     v_x += random.uniform(-v_magnitude * perturbation, v_magnitude * perturbation)
     v_y += random.uniform(-v_magnitude * perturbation, v_magnitude * perturbation)
-    
     return (v_x, v_y)
 
+
+def generate_velocity_seeds(p_pos, stars_arr, com, dist_to_com, total_mass,
+                             dist_to_boundary, n, chaos_kick=1.0):
+    """Diverse velocity candidates, capped at 14 chaotic seeds (18 total with the
+    4 conservative circular ones added by the caller).
+
+    Strategies:
+      B) 3 eccentric values toward the nearest star
+      C) 2 slingshot directions between the two nearest stars
+      D) 2 radial-kick tangential seeds
+    Then random.sample down to 14 so we never blow past the budget.
+    """
+    p      = np.array(p_pos, dtype=float)
+    c      = np.array(com,   dtype=float)
+    r      = c - p
+    if dist_to_com < 1:
+        return [(0.0, 0.0)]
+
+    v_circ = math.sqrt(G * total_mass / (dist_to_com + 1e-6))
+    r_unit = r / dist_to_com
+    t_unit = np.array([-r_unit[1], r_unit[0]])
+
+    chaotic: list = []
+
+    # ── B: Eccentric — 3 picks toward the nearest star ─────────────────────
+    dists_to_stars = np.sqrt(np.sum((stars_arr - p) ** 2, axis=1))
+    nearest_idx    = int(np.argmin(dists_to_stars))
+    to_near        = stars_arr[nearest_idx] - p
+    to_near_dist   = float(np.linalg.norm(to_near))
+    if to_near_dist > 1:
+        to_near_u    = to_near / to_near_dist
+        to_near_perp = np.array([-to_near_u[1], to_near_u[0]])
+        for ecc, mix in [(0.75, 0.35), (1.1, 0.55), (1.5, 0.75)]:
+            v_mag = v_circ * ecc * chaos_kick * random.uniform(0.92, 1.08)
+            v  = (to_near_perp * mix + to_near_u * (1.0 - mix)) * v_mag
+            vm = (to_near_perp * mix - to_near_u * (1.0 - mix)) * v_mag
+            chaotic.append((float(v[0]),  float(v[1])))
+            chaotic.append((float(vm[0]), float(vm[1])))
+
+    # ── C: Slingshot — 2 directions between the two nearest stars ──────────
+    if len(stars_arr) >= 2:
+        two_idx      = np.argsort(dists_to_stars)[:2]
+        mid          = (stars_arr[two_idx[0]] + stars_arr[two_idx[1]]) * 0.5
+        to_mid       = mid - p
+        to_mid_d     = float(np.linalg.norm(to_mid))
+        if to_mid_d > 1:
+            to_mid_u    = to_mid / to_mid_d
+            to_mid_perp = np.array([-to_mid_u[1], to_mid_u[0]])
+            for vf, tf in [(0.90, 0.55), (1.25, 0.65)]:
+                v_mag = v_circ * vf * chaos_kick
+                v = (to_mid_u * (1 - tf) + to_mid_perp * tf) * v_mag
+                chaotic.append((float(v[0]), float(v[1])))
+
+    # ── D: 2 pure-tangential seeds with a random radial kick ───────────────
+    for direction in [1.0, -1.0]:
+        vf        = random.uniform(0.80, 1.60)
+        radial_kf = random.uniform(-0.35, 0.35) * chaos_kick
+        v = (direction * t_unit + r_unit * radial_kf) * v_circ * vf
+        chaotic.append((float(v[0]), float(v[1])))
+
+    # Hard cap: never more than 14 chaotic seeds
+    if len(chaotic) > 14:
+        chaotic = random.sample(chaotic, 14)
+
+    return chaotic
+
 # ============================================================================
-# OPTIMIZED ALGORITHM
+# CHAOS PROBE & SCORING
+# ============================================================================
+
+def _compute_probe_chaos(direction_changes, speed_samples):
+    """Reusable chaos scorer — kept in sync with the live update_stats formula.
+
+    Weights: dir 0.35 + turn_freq 0.35 + speed 0.30.
+    Speed multiplier raised 5→8, caps lowered 10→8 so modest wobbles register
+    immediately rather than needing extreme variance to score.
+    """
+    if len(direction_changes) < 10 or len(speed_samples) < 10:
+        return 0.0
+    dc = np.asarray(direction_changes)
+    ss = np.asarray(speed_samples)
+    dir_score   = min(8.0, float(np.var(dc)) * 25.0)
+    turn_freq   = float(np.sum(dc > 0.1)) / len(dc) * 10.0
+    avg_spd     = float(np.mean(ss)) + 1e-6
+    speed_score = min(8.0, float(np.var(ss)) / avg_spd * 8.0)
+    return dir_score * 0.35 + turn_freq * 0.35 + speed_score * 0.30
+
+
+def _run_probe(p_pos, p_vel, stars_arr, steps=8000, dt=DT):
+    """Run the physics loop for up to `steps` steps.
+
+    Returns (steps_survived, chaos_score, max_energy_drift_pct).
+
+    Memory-efficient: direction_changes and speed_samples are pre-allocated
+    numpy arrays of length `steps`; we track a write cursor instead of appending.
+    Energy drift is sampled every 300 steps (was 200) to reduce float ops.
+    """
+    pos = np.array(p_pos, dtype=float)
+    vel = np.array(p_vel, dtype=float)
+    collision_dist = float(PLANET_RADIUS + STAR_RADIUS)
+
+    # Pre-allocate fixed-size arrays — no per-step list appends
+    dc_buf  = np.empty(steps, dtype=np.float32)   # direction changes
+    spd_buf = np.empty(steps, dtype=np.float32)   # speeds
+    dc_n    = 0   # write cursors
+    spd_n   = 0
+
+    prev_angle_loc = None
+    initial_energy = None
+    max_e_drift    = 0.0
+
+    for step in range(steps):
+        d       = stars_arr - pos
+        dist_sq = np.sum(d ** 2, axis=1)
+        dist_sq[dist_sq < 1e-6] = 1e-6
+        dist    = np.sqrt(dist_sq)
+
+        # Death checks
+        if dist[dist.argmin()] < collision_dist:
+            cs = _compute_probe_chaos(dc_buf[:dc_n], spd_buf[:spd_n])
+            return step, cs, max_e_drift
+        if not (MARGIN <= pos[0] <= WIDTH - MARGIN and
+                MARGIN <= pos[1] <= HEIGHT - MARGIN):
+            cs = _compute_probe_chaos(dc_buf[:dc_n], spd_buf[:spd_n])
+            return step, cs, max_e_drift
+
+        # Physics
+        f = G * M_STAR / dist_sq
+        a = np.sum(f[:, np.newaxis] * (d / dist[:, np.newaxis]), axis=0)
+        vel += a * dt
+        pos += vel * dt
+
+        spd = float(np.linalg.norm(vel))
+        spd_buf[spd_n] = spd
+        spd_n += 1
+
+        # Direction tracking
+        if spd > 1e-6:
+            ang = math.atan2(float(vel[1]), float(vel[0]))
+            if prev_angle_loc is not None:
+                dang = abs(ang - prev_angle_loc)
+                if dang > math.pi:
+                    dang = 2.0 * math.pi - dang
+                dc_buf[dc_n] = dang
+                dc_n += 1
+            prev_angle_loc = ang
+
+        # Energy drift — every 300 steps
+        if step % 300 == 0 and step > 0:
+            ke     = 0.5 * spd ** 2
+            pe     = float(np.sum(-G * M_STAR / np.maximum(dist, 1.0)))
+            energy = ke + pe
+            if initial_energy is None:
+                initial_energy = energy
+            elif initial_energy != 0.0:
+                drift = abs((energy - initial_energy) / abs(initial_energy)) * 100.0
+                if drift > max_e_drift:
+                    max_e_drift = drift
+
+    cs = _compute_probe_chaos(dc_buf[:dc_n], spd_buf[:spd_n])
+    return steps, cs, max_e_drift
+
+
+def score_candidate(survival_steps, probe_steps, chaos_score):
+    """Combined longevity × chaos metric.  Heavily rewards ultra-long survival."""
+    capped = min(survival_steps, probe_steps)
+    return (capped ** 1.2) * max(chaos_score, 0.5)
+
+
+# ============================================================================
+# OPTIMIZED ALGORITHM  (score-based, best-wins over full time budget)
 # ============================================================================
 
 def optimized_algorithm(p_pos, n, time_limit=SIMULATION_TIME_LIMIT):
-    """With fallback parameters"""
-    start_time = time.time()
+    """Score-based search: runs the entire time budget and returns the single best
+    (longevity × chaos) candidate found.
+
+    Memory/efficiency improvements vs previous version:
+      - Plain-Python asymmetry pre-check before any numpy allocation
+      - Seed count hard-capped at 18 (4 conservative + ≤14 chaotic)
+      - PROBE_STEPS reduced 12 000 → 8 000
+      - top_cands trimmed to 3; stars stored as tuple-of-tuples (immutable, GC-friendly)
+      - gc.collect() every 35 configs to prevent memory high-water mark creep
+      - EXT_PROBE_STEPS 40 000 → 25 000, only top-2 re-probed
+      - Fallback loop cut to 20 tries
+
+    Yields progress strings for the UI.
+    Returns (stars, vel, success, elapsed, total_attempts, efficiency) via StopIteration.
+    """
+    start_time     = time.time()
     config_attempt = 0
     total_attempts = 0
-    quick_rejects = 0
-    found = False
-    result_data = ([], (0, 0), False)
-    
-    min_star_dist = 2.0 * STAR_RADIUS
+    quick_rejects  = 0
+
+    best_score = -1.0
+    best_stars: tuple = ()        # tuple-of-tuples — immutable, smaller refs
+    best_vel   = (0.0, 0.0)
+    top_cands  = []               # (score, tuple-of-tuples stars, vel)  max 3
+
+    # ── Probe / filter parameters ────────────────────────────────────────────
+    PROBE_STEPS     = 8000
+    MIN_PASS_STEPS  = 2000
+    EXT_PROBE_STEPS = 25000
+    MIN_CHAOS_POT   = 0.00008
+
+    min_star_dist   = 2.0 * STAR_RADIUS
     min_planet_dist = PLANET_RADIUS + STAR_RADIUS + 70
-    spread_factor = 0.6
-    
-    while time.time() - start_time < time_limit:
-        config_attempt += 1
-        
-        elapsed = time.time() - start_time
-        if elapsed > time_limit * 0.7 and not found:
-            min_star_dist = 1.8 * STAR_RADIUS
-            min_planet_dist = PLANET_RADIUS + STAR_RADIUS + 50
-            spread_factor = 0.7
-        
-        stars = place_stars_randomly(n, p_pos, min_star_dist, min_planet_dist)
-        
-        if not stars and n > 0:
-            yield f"Config {config_attempt} (quick rejects: {quick_rejects}, {elapsed:.1f}s)"
-            continue
-        
-        if not stars and n == 0:
-            result_data = ([], (0, 0), True, elapsed, total_attempts, 100.0)
-            found = True
+
+    # ── Trivial n=0 case ─────────────────────────────────────────────────────
+    if n == 0:
+        return ([], (0, 0), True, time.time() - start_time, 0, 100.0)
+
+    # ── Main search loop ──────────────────────────────────────────────────────
+    while True:
+        elapsed        = time.time() - start_time
+        time_remaining = time_limit - elapsed
+        if time_remaining < 1.2:
             break
-        
+
+        config_attempt += 1
+
+        # Relax constraints once past 70 % of the budget with no winner yet
+        if elapsed > time_limit * 0.70 and best_score < 0:
+            min_star_dist   = 1.8 * STAR_RADIUS
+            min_planet_dist = PLANET_RADIUS + STAR_RADIUS + 48
+
+        # chaos_kick ramps 1.0 → 2.0 over the budget
+        chaos_kick = 1.0 + (elapsed / time_limit) * 1.0
+        if n < 10:
+            chaos_kick *= 1.2
+
+        # ── GC pulse every 35 configs ─────────────────────────────────────
+        if config_attempt % 35 == 0:
+            gc.collect()
+
+        # ── Star placement ────────────────────────────────────────────────
+        stars = place_stars_multi_cluster(n, p_pos, min_star_dist, min_planet_dist)
+        if not stars:
+            continue
+
+        # ── EARLY plain-Python asymmetry pre-check (no numpy yet) ────────
+        if n >= 3 and not _quick_check_asymmetry_plain(stars, p_pos):
+            continue
+
+        # ── Now build the numpy array once ───────────────────────────────
         stars_arr = np.array(stars, dtype=float)
-        com = stars_arr.mean(axis=0)
-        dist_to_com = np.linalg.norm(np.array(p_pos) - com)
-        total_mass = len(stars) * M_STAR
-        
-        if dist_to_com < 120:
+
+        # Full asymmetry + chaos-potential gates
+        if n >= 3 and not check_asymmetry(stars_arr, p_pos):
             continue
-        
-        com_to_edges = [
-            com[0] - MARGIN, WIDTH - MARGIN - com[0],
-            com[1] - MARGIN, HEIGHT - MARGIN - com[1]
-        ]
-        dist_to_boundary = min(com_to_edges)
-        
-        if dist_to_boundary < dist_to_com * 1.2 + 80:
+        if n >= 2 and compute_chaos_potential(stars_arr, p_pos) < MIN_CHAOS_POT:
             continue
-        
-        star_spread = np.std(np.linalg.norm(stars_arr - com, axis=1))
-        if star_spread > dist_to_boundary * spread_factor:
+
+        # COM geometry gate
+        com         = stars_arr.mean(axis=0)
+        dist_to_com = float(np.linalg.norm(np.array(p_pos, dtype=float) - com))
+        total_mass  = n * M_STAR
+        if dist_to_com < 50:
             continue
-        
-        if config_attempt < 40:
-            phase, vel_attempts = 1, 60
-        elif config_attempt < 80:
-            phase, vel_attempts = 2, 50
-        else:
-            phase, vel_attempts = 3, 40
-        
-        for vel_attempt in range(vel_attempts):
+
+        com_edges        = [com[0] - MARGIN, WIDTH  - MARGIN - com[0],
+                            com[1] - MARGIN, HEIGHT - MARGIN - com[1]]
+        dist_to_boundary = float(min(com_edges))
+        if dist_to_boundary < dist_to_com * 0.6 + 30:
+            continue
+
+        # ── Build seeds: 4 conservative circular + ≤14 chaotic = ≤18 total
+        v_c   = math.sqrt(G * total_mass / (dist_to_com + 1e-6))
+        r_vec = np.array(p_pos, dtype=float) - com
+        r_len = float(np.linalg.norm(r_vec))
+        seeds: list = []
+        if r_len > 1:
+            t_u = np.array([-r_vec[1], r_vec[0]]) / r_len
+            for direction in [1.0, -1.0]:
+                for vf in [0.90, 1.10]:           # 4 conservative seeds
+                    v = direction * t_u * v_c * vf
+                    seeds.append((float(v[0]), float(v[1])))
+
+        chaotic_seeds = generate_velocity_seeds(
+            p_pos, stars_arr, tuple(com.tolist()), dist_to_com,
+            total_mass, dist_to_boundary, n, chaos_kick,
+        )
+        random.shuffle(chaotic_seeds)
+        seeds.extend(chaotic_seeds)          # total ≤ 4 + 14 = 18
+
+        # ── Try each seed ─────────────────────────────────────────────────
+        for p_vel in seeds:
+            if time.time() - start_time > time_limit - 1.2:
+                break
+
             total_attempts += 1
-            
-            p_vel = calculate_velocity_smart(p_pos, tuple(com), dist_to_com, 
-                                             total_mass, dist_to_boundary, phase, n)
-            
+
             if not quick_validate(p_pos, p_vel, stars_arr):
                 quick_rejects += 1
                 continue
-            
-            if full_validate(p_pos, p_vel, stars_arr):
-                efficiency = (quick_rejects / max(total_attempts, 1)) * 100
-                result_data = (stars, p_vel, True, elapsed, total_attempts, efficiency)
-                found = True
-                break
-        
-        if found:
-            break
-        
+
+            survival, cs, e_drift = _run_probe(p_pos, p_vel, stars_arr, PROBE_STEPS)
+
+            if survival < MIN_PASS_STEPS:
+                continue
+
+            # Down-weight boringly stable, low-drift orbits
+            if e_drift < 0.04 and cs < 0.35:
+                cs = max(cs, 0.10)
+
+            cand_score = score_candidate(survival, PROBE_STEPS, cs)
+
+            # Store stars as tuple-of-tuples (immutable, smaller footprint)
+            stars_tup = tuple(tuple(s) for s in stars)
+
+            if cand_score > best_score:
+                best_score = cand_score
+                best_stars = stars_tup
+                best_vel   = p_vel
+
+            top_cands.append((cand_score, stars_tup, p_vel))
+            top_cands.sort(key=lambda x: x[0], reverse=True)
+            del top_cands[3:]          # keep only top 3
+
+        # ── Status every 5 configs ────────────────────────────────────────
         if config_attempt % 5 == 0:
-            elapsed = time.time() - start_time
-            efficiency = (quick_rejects / max(total_attempts, 1)) * 100
-            yield f"Config {config_attempt} ({total_attempts} attempts, {efficiency:.0f}% quick-rejected, {elapsed:.1f}s)"
-    
-    if not found:
-        efficiency = (quick_rejects / max(total_attempts, 1)) * 100
-        result_data = ([], (0, 0), False, elapsed, total_attempts, efficiency)
-    
-    return result_data
+            eff         = (quick_rejects / max(total_attempts, 1)) * 100
+            score_str   = f"{best_score:.0f}" if best_score >= 0 else "none yet"
+            elapsed_now = time.time() - start_time
+            yield (f"Config {config_attempt} | {total_attempts} vel trials | "
+                   f"QR {eff:.0f}% | Best score: {score_str} | {elapsed_now:.1f}s")
+
+    # ── Extended re-probe on top-2 candidates if time permits ────────────────
+    elapsed_now    = time.time() - start_time
+    time_remaining = time_limit - elapsed_now
+    if top_cands and time_remaining > 2.0:
+        yield "Extending top candidates..."
+        for _, cand_stars_tup, cand_vel in top_cands[:2]:
+            if time.time() - start_time > time_limit - 0.8:
+                break
+            ca        = np.array(cand_stars_tup, dtype=float)
+            ext_surv, ext_cs, _ = _run_probe(p_pos, cand_vel, ca, EXT_PROBE_STEPS)
+            ext_score = score_candidate(ext_surv, EXT_PROBE_STEPS, ext_cs)
+            if ext_score > best_score:
+                best_score = ext_score
+                best_stars = cand_stars_tup
+                best_vel   = cand_vel
+
+    # ── Lean fallback: 20 tries with the legacy random placer ────────────────
+    if best_score < 0:
+        yield "No scored candidate — running fallback..."
+        fb_stars = place_stars_randomly(n, p_pos, min_star_dist, min_planet_dist)
+        if fb_stars:
+            fb_arr = np.array(fb_stars, dtype=float)
+            fb_com = fb_arr.mean(axis=0)
+            fb_dtc = float(np.linalg.norm(np.array(p_pos, dtype=float) - fb_com))
+            for _ in range(20):
+                fv = calculate_velocity_smart(
+                    p_pos, tuple(fb_com.tolist()), fb_dtc,
+                    n * M_STAR, 300.0, 1, n,
+                )
+                if quick_validate(p_pos, fv, fb_arr):
+                    surv, cs, _ = _run_probe(p_pos, fv, fb_arr, PROBE_STEPS)
+                    if surv >= MIN_PASS_STEPS:
+                        best_score = score_candidate(surv, PROBE_STEPS, cs)
+                        best_stars = tuple(tuple(s) for s in fb_stars)
+                        best_vel   = fv
+                        break
+
+    gc.collect()   # final cleanup before returning to the pygame thread
+
+    # ── Post-winner local velocity search (±3 % magnitude, 8 directions) ──────
+    # Costs ~8 × 2000-step probes — negligible — but often squeezes 5-10 % more
+    # survival time by escaping a local optimum in velocity space.
+    if best_score >= 0 and best_stars:
+        best_arr = np.array(best_stars, dtype=float)
+        vx, vy   = best_vel
+        v_mag    = math.hypot(vx, vy)
+        v_ang    = math.atan2(vy, vx)
+        if v_mag > 1e-6:
+            NUDGE_STEPS = 2000
+            for mag_factor in (0.97, 1.03):
+                for ang_delta in (-0.04, 0.0, 0.04, 0.08):
+                    new_ang = v_ang + ang_delta
+                    new_mag = v_mag * mag_factor
+                    nv = (math.cos(new_ang) * new_mag, math.sin(new_ang) * new_mag)
+                    surv_n, cs_n, _ = _run_probe(p_pos, nv, best_arr, NUDGE_STEPS)
+                    sc_n = score_candidate(surv_n, NUDGE_STEPS, cs_n)
+                    # Normalise: compare on same probe length as original best
+                    nudge_equiv = score_candidate(surv_n, PROBE_STEPS, cs_n)
+                    if nudge_equiv > best_score:
+                        best_score = nudge_equiv
+                        best_vel   = nv
+
+    # ── Return ────────────────────────────────────────────────────────────────
+    elapsed    = time.time() - start_time
+    efficiency = (quick_rejects / max(total_attempts, 1)) * 100
+
+    if best_score >= 0 and best_stars:
+        return (list(best_stars), best_vel, True, elapsed, total_attempts, efficiency)
+    else:
+        return ([], (0, 0), False, elapsed, total_attempts, efficiency)
 
 # ============================================================================
 # STATISTICS HELPERS
@@ -475,34 +904,29 @@ def update_stats(p_pos, p_vel, stars, prev_pos=None):
                 stats['direction_changes'].pop(0)
         prev_angle = current_angle
     
-    # Enhanced chaos score calculation with speed variance
+    # Enhanced chaos score — kept in perfect sync with _compute_probe_chaos
     if len(stats['direction_changes']) > 10 and len(stats['speed_samples']) > 10:
-        # Direction variance (spread of turns)
         direction_variance = np.var(stats['direction_changes'])
-        direction_score = min(10.0, direction_variance * 20)
-        
-        # Turn frequency (significant turns >0.1 rad)
-        significant_turns = sum(1 for change in stats['direction_changes'] if change > 0.1)
+        direction_score = min(8.0, direction_variance * 25.0)   # was min(10, *20)
+
+        significant_turns = sum(1 for c in stats['direction_changes'] if c > 0.1)
         turn_frequency = (significant_turns / len(stats['direction_changes'])) * 10
-        
-        # Speed variance (variability in velocity magnitude)
+
         speed_variance = np.var(stats['speed_samples'])
-        speed_score = min(10.0, speed_variance / (stats['avg_speed'] + 1e-6) * 5)  # Normalized by avg speed
+        speed_score = min(8.0, speed_variance / (stats['avg_speed'] + 1e-6) * 8.0)  # was min(10, *5), weight 0.2
+
+        stats['chaos_score'] = direction_score * 0.35 + turn_frequency * 0.35 + speed_score * 0.30
         
-        # Weighted chaos score
-        stats['chaos_score'] = (direction_score * 0.4 + turn_frequency * 0.4 + speed_score * 0.2)
-        
-        # Generate explanation
-        if stats['chaos_score'] < 2:
-            stats['chaos_explanation'] = "Very stable orbit with minimal direction changes and steady speed"
-        elif stats['chaos_score'] < 4:
-            stats['chaos_explanation'] = "Stable orbit with occasional minor adjustments and slight speed variations"
-        elif stats['chaos_score'] < 6:
-            stats['chaos_explanation'] = "Moderately chaotic with regular course corrections and noticeable speed changes"
-        elif stats['chaos_score'] < 8:
-            stats['chaos_explanation'] = "Highly chaotic orbit with frequent sharp turns and variable speeds"
+        if stats['chaos_score'] < 1.5:
+            stats['chaos_explanation'] = "Very stable orbit — smooth arc, steady speed"
+        elif stats['chaos_score'] < 3.5:
+            stats['chaos_explanation'] = "Gently perturbed — occasional wobbles, slight speed shifts"
+        elif stats['chaos_score'] < 5.5:
+            stats['chaos_explanation'] = "Moderately chaotic — regular swerves and noticeable acceleration"
+        elif stats['chaos_score'] < 7.5:
+            stats['chaos_explanation'] = "Highly chaotic — sharp turns, wild speed swings"
         else:
-            stats['chaos_explanation'] = "Extremely erratic orbit, barely controlled chaos with wild speed fluctuations"
+            stats['chaos_explanation'] = "Maximum chaos — barely controlled gravitational pinball"
     
     # Trail distance
     if prev_pos:
@@ -560,52 +984,46 @@ def speed_to_color(speed, max_speed):
     
     return (r, g, b)
 
-def draw_trail_enhanced(trail, speed_samples, max_speed):
-    """Draw trail with different modes"""
+def draw_trail_enhanced(trail):
+    """Draw trail with different modes.
+
+    trail is a list of (pos, color) tuples — colors are permanently stamped at
+    the moment each point was recorded, so the trail never retroactively recolors.
+    """
     if len(trail) < 2 or not show_trail:
         return
-    
-    if trail_mode == 1:  # Solid
+
+    if trail_mode == 1:        # Solid — positions only, uniform blue
         for i in range(1, len(trail)):
             try:
-                pygame.draw.line(screen, TRAIL_COLOR, 
-                               (int(trail[i-1][0]), int(trail[i-1][1])),
-                               (int(trail[i][0]), int(trail[i][1])), 2)
-            except:
-                pass
-    
-    elif trail_mode == 0:  # Speed-colored
-        # Ensure speed_samples aligns with trail by using recent speeds
-        speed_len = len(speed_samples)
-        trail_len = len(trail)
-        for i in range(1, trail_len):
-            try:
-                # Map to speed: use last speeds cyclically if mismatch
-                speed_idx = min(i-1, speed_len-1)
-                speed = speed_samples[speed_idx]
-                color = speed_to_color(speed, max_speed)
-                pygame.draw.line(screen, color, 
-                               (int(trail[i-1][0]), int(trail[i-1][1])),
-                               (int(trail[i][0]), int(trail[i][1])), 2)
-            except:
-                pass
-    
-    elif trail_mode == 2:  # Faded
-        for i in range(1, len(trail)):
-            try:
-                alpha_ratio = i / len(trail)
-                color = (
-                    int(TRAIL_COLOR[0] * alpha_ratio),
-                    int(TRAIL_COLOR[1] * alpha_ratio),
-                    int(TRAIL_COLOR[2] * alpha_ratio)
-                )
-                pygame.draw.line(screen, color, 
-                               (int(trail[i-1][0]), int(trail[i-1][1])),
-                               (int(trail[i][0]), int(trail[i][1])), 2)
-            except:
+                pygame.draw.line(screen, TRAIL_COLOR,
+                                 (int(trail[i-1][0][0]), int(trail[i-1][0][1])),
+                                 (int(trail[i][0][0]),   int(trail[i][0][1])), 2)
+            except Exception:
                 pass
 
-    # Mode 3: off - nothing drawn
+    elif trail_mode == 0:      # Speed-colored — use stamped color, never changes
+        for i in range(1, len(trail)):
+            try:
+                pygame.draw.line(screen, trail[i-1][1],
+                                 (int(trail[i-1][0][0]), int(trail[i-1][0][1])),
+                                 (int(trail[i][0][0]),   int(trail[i][0][1])), 2)
+            except Exception:
+                pass
+
+    elif trail_mode == 2:      # Faded — stamped color dimmed by age
+        n = len(trail)
+        for i in range(1, n):
+            try:
+                alpha = i / n
+                r, g, b = trail[i-1][1]
+                faded = (int(r * alpha), int(g * alpha), int(b * alpha))
+                pygame.draw.line(screen, faded,
+                                 (int(trail[i-1][0][0]), int(trail[i-1][0][1])),
+                                 (int(trail[i][0][0]),   int(trail[i][0][1])), 2)
+            except Exception:
+                pass
+    # Mode 3: off — nothing drawn
 
 def draw_background_grid():
     grid_color = (20, 20, 20)
@@ -766,13 +1184,14 @@ def draw_stats_panel():
     line_height = 20
     
     pygame.draw.rect(screen, (10, 10, 20, 180), 
-                    (panel_x - 5, panel_y - 5, 280, 140))
+                    (panel_x - 5, panel_y - 5, 300, 160))
     
     texts = [
         f"Closest to star: {stats['closest_to_star']:.1f}px",
         f"Closest to boundary: {stats['closest_to_boundary']:.1f}px",
         f"Current speed: {stats['current_speed']:.1f}",
         f"Max speed: {stats['max_speed']:.1f}",
+        f"Chaos score: {stats['chaos_score']:.2f}/10",
         f"Energy drift: {stats['max_energy_drift']:.2f}%",
         f"Algorithm: {stats['algorithm_time']:.2f}s, {stats['algorithm_attempts']} attempts",
         f"Efficiency: {stats['algorithm_efficiency']:.0f}% quick-rejected"
@@ -782,7 +1201,14 @@ def draw_stats_panel():
         if i < 4:
             color = (200, 200, 200)
         elif i == 4:
-            # Energy drift color based on accuracy (green=good, yellow=ok, red=bad)
+            cs = stats['chaos_score']
+            if cs < 3:
+                color = (150, 200, 255)
+            elif cs < 6:
+                color = (255, 255, 100)
+            else:
+                color = (255, 120, 80)
+        elif i == 5:
             drift = stats['max_energy_drift']
             if drift < 1.0:
                 color = (100, 255, 100)
@@ -840,159 +1266,173 @@ def draw_high_scores_panel():
         screen.blit(surf, (panel_x + 10, panel_y + 30 + i * 22))
 
 def show_finale_window():
-    """Launch statistics window"""
-    finale_width = 550
-    finale_height = 750
-    
-    finale_screen = pygame.display.set_mode((finale_width, finale_height))
+    """Session statistics — clean two-column label/value layout with section headers."""
+    FW, FH = 560, 730
+    fs = pygame.display.set_mode((FW, FH))
     pygame.display.set_caption("Session Statistics")
-    
-    finale_font = pygame.font.Font(None, 32)
-    finale_small = pygame.font.Font(None, 22)
-    finale_tiny = pygame.font.Font(None, 18)
-    
-    time_color = (150, 200, 255)
-    safety_color = (255, 200, 150)
-    speed_color = (150, 255, 150)
-    chaos_color = (255, 255, 100)
-    algo_color = (255, 150, 255)
-    record_color = (255, 215, 0)
-    
+
+    f_title = pygame.font.Font(None, 40)
+    f_head  = pygame.font.Font(None, 21)
+    f_body  = pygame.font.Font(None, 20)
+    f_tiny  = pygame.font.Font(None, 17)
+
+    # Palette — all colours defined once, used everywhere
+    BG      = (10, 10, 20)
+    PANEL   = (20, 20, 36)
+    SEP     = (45, 45, 75)
+    ACCENT  = (75, 95, 190)
+    DIM     = (105, 105, 140)
+    WHITE   = (225, 225, 238)
+    C_TIME  = (110, 185, 255)
+    C_SAFE  = (255, 195, 105)
+    C_SPD   = (110, 255, 155)
+    C_CHAOS = (255, 238, 80)
+    C_ALGO  = (205, 135, 255)
+    C_GOLD  = (255, 208, 48)
+    C_RED   = (255, 85, 85)
+    C_GREEN = (75, 255, 135)
+
+    # Badge & difficulty
+    diff = (stats['survival_time'] * 1.8 + stats['chaos_score'] * 22.0 +
+            stats['close_approaches'] * 6.0 + n_stars * 3.5 + stats['avg_speed'] * 0.4)
+    stats['difficulty_score'] = diff
+    if   diff > 750: badge, bcol = "CHAOS LEGEND", C_GOLD
+    elif diff > 420: badge, bcol = "Master",        (195, 175, 255)
+    elif diff > 200: badge, bcol = "Expert",         C_GREEN
+    elif diff > 80:  badge, bcol = "Skilled",        C_SPD
+    else:            badge, bcol = "Novice",         DIM
+
     new_record = update_high_scores()
-    
-    # Calculate difficulty badge
-    if stats['avg_speed'] > 0 and stats['closest_to_boundary'] != float('inf'):
-        stats['difficulty_score'] = (n_stars * stats['avg_speed']) / max(1, stats['closest_to_boundary'])
-    
-    badge = "Novice"
-    if stats['difficulty_score'] > 50:
-        badge = "Skilled"
-    if stats['difficulty_score'] > 100:
-        badge = "Expert"
-    if stats['difficulty_score'] > 200:
-        badge = "Master"
-    if stats['difficulty_score'] > 400:
-        badge = "CHAOS LEGEND"
-    
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+    LPAD, RPAD = 32, FW - 32
+
+    def sep(y):
+        pygame.draw.line(fs, SEP, (LPAD, y), (RPAD, y), 1)
+
+    def section(label, y):
+        s = f_head.render(label.upper(), True, ACCENT)
+        fs.blit(s, (LPAD, y))
+        pygame.draw.line(fs, ACCENT,
+                         (LPAD + s.get_width() + 6, y + s.get_height() // 2),
+                         (RPAD, y + s.get_height() // 2), 1)
+        return y + s.get_height() + 5
+
+    def row(label, value, y, vc=WHITE):
+        ls = f_body.render(label, True, DIM)
+        vs = f_body.render(value, True, vc)
+        fs.blit(ls, (LPAD + 8, y))
+        fs.blit(vs, (RPAD - vs.get_width(), y))
+        return y + ls.get_height() + 4
+
+    def bar(ratio, y, col, h=8):
+        W = RPAD - LPAD - 8
+        pygame.draw.rect(fs, (28, 28, 48), (LPAD + 8, y, W, h), border_radius=3)
+        if ratio > 0:
+            pygame.draw.rect(fs, col, (LPAD + 8, y, int(ratio * W), h), border_radius=3)
+        return y + h + 6
+
+    # ── Main render loop ───────────────────────────────────────────────────
     running = True
     while running:
-        for event in pygame.event.get():
-            if event.type == QUIT:
+        for ev in pygame.event.get():
+            if ev.type == QUIT:
                 running = False
-            elif event.type == KEYDOWN:
-                if event.key in (K_ESCAPE, K_SPACE, K_RETURN):
-                    running = False
-        
-        finale_screen.fill((15, 15, 25))
-        
-        # Title
-        death_color = (255, 100, 100) if stats['death_cause'] else (100, 255, 100)
-        title_text = "SIMULATION ENDED" if stats['death_cause'] else "SESSION COMPLETE"
-        title = finale_font.render(title_text, True, death_color)
-        finale_screen.blit(title, ((finale_width - title.get_width()) // 2, 15))
-        
-        # Death cause / culprit
-        y_pos = 55
-        if stats['death_cause']:
-            cause = finale_small.render(stats['death_cause'], True, (255, 150, 150))
-            finale_screen.blit(cause, ((finale_width - cause.get_width()) // 2, y_pos))
-            y_pos += 25
-            
+            elif ev.type == KEYDOWN and ev.key in (K_ESCAPE, K_SPACE, K_RETURN):
+                running = False
+
+        fs.fill(BG)
+        y = 16
+
+        # Header
+        died      = bool(stats['death_cause'])
+        hdr_col   = C_RED if died else C_GREEN
+        hdr_txt   = "SIMULATION ENDED" if died else "SESSION COMPLETE"
+        hs = f_title.render(hdr_txt, True, hdr_col)
+        fs.blit(hs, ((FW - hs.get_width()) // 2, y));  y += hs.get_height() + 5
+
+        if died:
+            cs = f_body.render(stats['death_cause'], True, (215, 110, 110))
+            fs.blit(cs, ((FW - cs.get_width()) // 2, y));  y += cs.get_height() + 2
             if stats['culprit_info']:
-                culprit = finale_tiny.render(stats['culprit_info'], True, (200, 120, 120))
-                finale_screen.blit(culprit, ((finale_width - culprit.get_width()) // 2, y_pos))
-                y_pos += 30
-        else:
-            y_pos += 10
-        
-        # Badge
-        badge_text = finale_small.render(f"★ {badge} ★", True, record_color)
-        finale_screen.blit(badge_text, ((finale_width - badge_text.get_width()) // 2, y_pos))
-        y_pos += 35
-        
-        # Statistics
-        line_height = 26
-        
-        stats_list = [
-            (f"Survival Time: {stats['survival_time']:.2f}s", time_color),
-            (f"Distance Traveled: {stats['trail_length_traveled']:.1f}px", time_color),
-            (f"Trail Points: {stats['total_trail_points']:,}", time_color),
-            ("", (0, 0, 0)),
-            
-            (f"Closest to Star: {stats['closest_to_star']:.1f}px" if stats['closest_to_star'] != float('inf') else "Closest to Star: N/A", safety_color),
-            (f"Closest to Boundary: {stats['closest_to_boundary']:.1f}px" if stats['closest_to_boundary'] != float('inf') else "Closest to Boundary: N/A", safety_color),
-            (f"Close Calls: {stats['close_approaches']}", safety_color),
-            ("", (0, 0, 0)),
-            
-            (f"Maximum Speed: {stats['max_speed']:.2f}", speed_color),
-            (f"Average Speed: {stats['avg_speed']:.2f}", speed_color),
-            (f"Final Speed: {stats['current_speed']:.2f}", speed_color),
-            ("", (0, 0, 0)),
-            
-            (f"Chaos Score: {stats['chaos_score']:.1f}/10", chaos_color),
-            (f"Difficulty: {stats['difficulty_score']:.1f}", chaos_color),
-            ("", (0, 0, 0)),
-            
-            (f"Calculation Time: {stats['algorithm_time']:.2f}s", algo_color),
-            (f"Total Attempts: {stats['algorithm_attempts']}", algo_color),
-            (f"Quick-Reject: {stats['algorithm_efficiency']:.1f}%", algo_color),
-            (f"Energy Drift: {stats['max_energy_drift']:.2f}%", algo_color),
-        ]
-        
-        for text, color in stats_list:
-            if text:
-                surf = finale_small.render(text, True, color)
-                finale_screen.blit(surf, (30, y_pos))
-            y_pos += line_height
-        
-        # Chaos explanation (wrapped if needed)
+                ci = f_tiny.render(stats['culprit_info'], True, (155, 85, 85))
+                fs.blit(ci, ((FW - ci.get_width()) // 2, y));  y += ci.get_height() + 2
+
+        y += 6;  sep(y);  y += 10
+
+        # Badge pill
+        pill_w, pill_h = 224, 32
+        pill_x = (FW - pill_w) // 2
+        pygame.draw.rect(fs, PANEL, (pill_x, y, pill_w, pill_h), border_radius=8)
+        pygame.draw.rect(fs, bcol,  (pill_x, y, pill_w, pill_h), 1, border_radius=8)
+        bt = f_head.render(f"★  {badge}  ★", True, bcol)
+        fs.blit(bt, ((FW - bt.get_width()) // 2, y + (pill_h - bt.get_height()) // 2))
+        y += pill_h + 5
+
+        diff_s = f_tiny.render(f"Difficulty  {diff:.0f}", True, DIM)
+        fs.blit(diff_s, ((FW - diff_s.get_width()) // 2, y));  y += diff_s.get_height() + 8
+        sep(y);  y += 10
+
+        # Survival
+        y = section("Survival", y)
+        y = row("Time survived",     f"{stats['survival_time']:.2f} s",          y, C_TIME)
+        y = row("Distance traveled", f"{stats['trail_length_traveled']:.0f} px", y, C_TIME)
+        y += 4;  sep(y);  y += 10
+
+        # Safety
+        y = section("Safety", y)
+        cts = f"{stats['closest_to_star']:.1f} px"      if stats['closest_to_star']     != float('inf') else "N/A"
+        ctb = f"{stats['closest_to_boundary']:.1f} px"  if stats['closest_to_boundary'] != float('inf') else "N/A"
+        y = row("Closest to star",      cts,                            y, C_SAFE)
+        y = row("Closest to boundary",  ctb,                            y, C_SAFE)
+        y = row("Close calls",          str(stats['close_approaches']), y, C_SAFE)
+        y += 4;  sep(y);  y += 10
+
+        # Speed
+        y = section("Speed", y)
+        y = row("Peak speed",    f"{stats['max_speed']:.2f}",  y, C_SPD)
+        y = row("Average speed", f"{stats['avg_speed']:.2f}",  y, C_SPD)
+        y += 4;  sep(y);  y += 10
+
+        # Chaos
+        y = section("Chaos", y)
+        cs_val = stats['chaos_score']
+        cs_col = C_CHAOS if cs_val < 6 else (255, 155, 55) if cs_val < 8 else C_RED
+        y = row("Chaos score", f"{cs_val:.2f} / 10", y, cs_col)
+        y = bar(min(1.0, cs_val / 10.0), y, cs_col)
         if stats['chaos_explanation']:
-            y_pos += 5
-            explanation = stats['chaos_explanation']
-            # Word wrap for long explanations
-            words = explanation.split()
-            line = ""
-            for word in words:
-                test_line = line + word + " "
-                if finale_tiny.size(test_line)[0] < finale_width - 60:
-                    line = test_line
-                else:
-                    surf = finale_tiny.render(line, True, (200, 200, 100))
-                    finale_screen.blit(surf, (30, y_pos))
-                    y_pos += 20
-                    line = word + " "
-            if line:
-                surf = finale_tiny.render(line, True, (200, 200, 100))
-                finale_screen.blit(surf, (30, y_pos))
-                y_pos += 20
-        
-        # High Scores
-        y_pos += 10
-        records_title = finale_small.render("═══ HIGH SCORES ═══", True, record_color)
-        finale_screen.blit(records_title, ((finale_width - records_title.get_width()) // 2, y_pos))
-        y_pos += 30
-        
-        high_score_list = [
-            f"Longest Survival: {high_scores['longest_survival']:.2f}s",
-            f"Most Chaotic: {high_scores['most_chaotic']:.1f}/10",
-            f"Furthest Traveled: {high_scores['furthest_traveled']:.1f}px",
-        ]
-        
-        for hs_text in high_score_list:
-            surf = finale_tiny.render(hs_text, True, record_color)
-            finale_screen.blit(surf, (40, y_pos))
-            y_pos += 24
-        
+            xe = f_tiny.render(stats['chaos_explanation'], True, DIM)
+            fs.blit(xe, (LPAD + 8, y));  y += xe.get_height() + 4
+        y += 4;  sep(y);  y += 10
+
+        # Algorithm
+        y = section("Algorithm", y)
+        y = row("Calculation time", f"{stats['algorithm_time']:.2f} s",      y, C_ALGO)
+        y = row("Velocity trials",  str(stats['algorithm_attempts']),         y, C_ALGO)
+        y = row("Quick-rejected",   f"{stats['algorithm_efficiency']:.0f}%",  y, C_ALGO)
+        ed = stats['max_energy_drift']
+        ed_col = C_GREEN if ed < 1 else C_SAFE if ed < 5 else C_RED
+        y = row("Energy drift",     f"{ed:.2f}%", y, ed_col)
+        y += 4;  sep(y);  y += 10
+
+        # High scores
+        y = section("High Scores", y)
+        y = row("Longest survival",   f"{high_scores['longest_survival']:.2f} s",   y, C_GOLD)
+        y = row("Most chaotic",       f"{high_scores['most_chaotic']:.2f} / 10",    y, C_GOLD)
+        y = row("Furthest traveled",  f"{high_scores['furthest_traveled']:.0f} px", y, C_GOLD)
+
         if new_record:
-            new_record_text = finale_small.render("★ NEW RECORD! ★", True, (255, 255, 0))
-            finale_screen.blit(new_record_text, ((finale_width - new_record_text.get_width()) // 2, y_pos + 5))
-        
-        instructions = finale_small.render("Press any key to continue", True, (180, 180, 180))
-        finale_screen.blit(instructions, ((finale_width - instructions.get_width()) // 2, finale_height - 40))
-        
+            nr = f_head.render("★  NEW RECORD  ★", True, C_GOLD)
+            fs.blit(nr, ((FW - nr.get_width()) // 2, y + 4));  y += nr.get_height() + 8
+
+        # Footer
+        sep(FH - 30)
+        ft = f_tiny.render("SPACE  /  ENTER  /  ESC  to continue", True, DIM)
+        fs.blit(ft, ((FW - ft.get_width()) // 2, FH - 20))
+
         pygame.display.flip()
         clock.tick(30)
-    
+
     pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Chaotic Gravity Simulator - Complete")
 
@@ -1008,6 +1448,7 @@ calculating = False
 calc_message = ""
 calc_generator = None
 simulation_time = 0
+calc_best_score = -1.0   # tracks best score seen so far during calculation
 
 while running:
     screen.fill(BG_COLOR)
@@ -1065,6 +1506,7 @@ while running:
                         if 0 <= n_stars <= 100:
                             calculating = True
                             calc_message = "Starting calculation..."
+                            calc_best_score = -1.0
                             calc_generator = optimized_algorithm(planet_pos, n_stars)
                             state = "calculating"
                         else:
@@ -1144,11 +1586,57 @@ while running:
             result = next(calc_generator)
             if isinstance(result, str):
                 calc_message = result
-                screen.fill(BG_COLOR)
-                text = font.render(calc_message, True, (255, 255, 255))
-                screen.blit(text, (WIDTH//2 - 300, HEIGHT//2))
-                hint = small_font.render("Multi-stage validation: Quick check → Full simulation", True, (150, 150, 150))
-                screen.blit(hint, (WIDTH//2 - 260, HEIGHT//2 + 40))
+                # Parse best score from progress messages like "Best score: 12345"
+                global calc_best_score
+                if "Best score:" in result:
+                    try:
+                        token = result.split("Best score:")[1].strip().split()[0]
+                        if token != "none":
+                            calc_best_score = float(token)
+                    except Exception:
+                        pass
+
+                # ── Calculation screen ────────────────────────────────────
+                screen.fill((8, 8, 16))
+                draw_background_grid()
+
+                # Title
+                title_surf = font.render("Finding Perfect Orbit…", True, (180, 180, 255))
+                screen.blit(title_surf, (WIDTH // 2 - title_surf.get_width() // 2, HEIGHT // 2 - 90))
+
+                # Status message
+                msg_surf = small_font.render(calc_message, True, (140, 160, 200))
+                screen.blit(msg_surf, (WIDTH // 2 - msg_surf.get_width() // 2, HEIGHT // 2 - 48))
+
+                # Best-score progress bar
+                BAR_W, BAR_H = 420, 18
+                bar_x = WIDTH // 2 - BAR_W // 2
+                bar_y = HEIGHT // 2 + 2
+                MAX_SCORE = 80000.0
+                pygame.draw.rect(screen, (30, 30, 50), (bar_x - 2, bar_y - 2, BAR_W + 4, BAR_H + 4))
+                pygame.draw.rect(screen, (50, 50, 80), (bar_x, bar_y, BAR_W, BAR_H))
+                if calc_best_score > 0:
+                    fill = int(min(1.0, calc_best_score / MAX_SCORE) * BAR_W)
+                    # Gradient: deep blue → electric cyan
+                    ratio = min(1.0, calc_best_score / MAX_SCORE)
+                    bar_r = int(20  + ratio * 40)
+                    bar_g = int(120 + ratio * 135)
+                    bar_b = int(200 + ratio * 55)
+                    pygame.draw.rect(screen, (bar_r, bar_g, bar_b), (bar_x, bar_y, fill, BAR_H))
+                pygame.draw.rect(screen, (80, 80, 130), (bar_x, bar_y, BAR_W, BAR_H), 1)
+
+                # Score label
+                if calc_best_score > 0:
+                    score_lbl = tiny_font.render(f"Best score: {calc_best_score:.0f}", True, (160, 220, 255))
+                else:
+                    score_lbl = tiny_font.render("Searching…", True, (100, 100, 160))
+                screen.blit(score_lbl, (WIDTH // 2 - score_lbl.get_width() // 2, bar_y + BAR_H + 8))
+
+                hint = tiny_font.render(
+                    "Scoring all candidates: longevity × chaos — best wins at timeout",
+                    True, (70, 70, 110))
+                screen.blit(hint, (WIDTH // 2 - hint.get_width() // 2, HEIGHT // 2 + 62))
+
                 pygame.display.flip()
             else:
                 if len(result) == 6:
@@ -1200,7 +1688,7 @@ while running:
             calc_generator = None
     
     # Draw trail
-    draw_trail_enhanced(planet_trail, stats['speed_samples'], stats['max_speed'])
+    draw_trail_enhanced(planet_trail)
     
     # Draw stars
     for sp in stars_pos:
@@ -1329,7 +1817,10 @@ while running:
             update_stats(planet_pos, planet_vel, stars_pos, prev_pos)
         
         if state == "simulating" and trail_mode != 3:
-            planet_trail.append(planet_pos)
+            stamped_color = speed_to_color(
+                math.hypot(planet_vel[0], planet_vel[1]), stats['max_speed']
+            )
+            planet_trail.append((planet_pos, stamped_color))
             if trail_mode == 2 and len(planet_trail) > FADED_TRAIL_LIMIT:
                 planet_trail.pop(0)
     
