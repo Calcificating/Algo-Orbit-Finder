@@ -1,6 +1,6 @@
 # Algo-Orbit-Finder
 A gravity toy where you place a planet and choose how many stars to scatter. The algorithm searches for the **best chaotic yet long-lasting orbit**. 
-maximizing survival time while keeping the motion wild and unpredictable.
+maximizing survival time while keeping the motion wild and unpredictable. Right now its undergoing a massive architectual overhaul (WIP).
 
 ### Features
 - Click to place your planet
